@@ -1,0 +1,340 @@
+<?php
+
+namespace app\modules\api\v1\controllers;
+
+use app\modules\user\Finder;
+use app\modules\user\models\Account;
+use app\models\LoginForm;
+use yii\web\Controller;
+use yii\db\Expression;
+use yii\helpers\ArrayHelper;
+use app\models\ActionHistory;
+use app\models\AppDetail;
+use yii\helpers\Json;
+use Yii;
+
+/**
+ * Member controller for the `api` module
+ */
+class UserController extends Controller {
+
+    protected $finder;
+//public $response = [];
+
+    private $response = [];
+    private $post_json;
+    private $data_json;
+    public $app_id;
+    public $imei_no;
+
+    /*
+     * \Yii::$app->controller->module
+     */
+    public $current_module;
+
+    public function beforeAction($event) {
+        $this->current_module = \Yii::$app->controller->module;
+        $this->post_json = $this->current_module->post_json;
+        $this->data_json = $this->current_module->data_json;
+        $this->response['status'] = "1";
+        $this->response['message'] = "Success";
+        $this->response['data'] = "";
+        return parent::beforeAction($event);
+    }
+   
+    public function actionPing($from="") {
+        $notification_grp = \app\models\Notification::find()->where('acknowledge_status = 0 and user_id="' . \Yii::$app->user->identity->id . '"')->groupBy(['notification_type', 'detail_id'])->limit(30)->all();
+
+        foreach ($notification_grp as $notification_grp_main) {
+            $notitifcation_grp1 = \app\models\Notification::find()->where('acknowledge_status = 0 and user_id="' . \Yii::$app->user->identity->id . '" and notification_type="' . $notification_grp_main->notification_type . '" and detail_id="' . $notification_grp_main->detail_id . '"')->orderBy('id asc')->all();
+
+            foreach ($notitifcation_grp1 as $notification) {
+                try {
+                    $firbase_tocken = $notification->user->activeapp != NULL ? $notification->user->activeapp->firebase_token : '';
+                    if ($firbase_tocken != "") {
+                        $firebase = new \app\components\GoogleFirebase($notification, '1', '1');
+
+                        $response = $firebase->send($firbase_tocken);
+                        $response_result = json_decode($response);
+                    } else {
+                        $response_result = null;
+                    }
+
+                    $notification->cron_status = '1';
+                    $notification->send_count = ($notification->send_count + 1);
+                    $notification_model_detail = new \app\models\NotificationFirebaseDetail();
+                    $notification_model_detail->notification_id = $notification->id;
+
+                    if ($response_result == null) {
+                        $notification->status = 0;
+                        $notification_model_detail->firebase_message = "No Token";
+                    } else {
+                        if ($response_result->success) {
+                            $notification->status = 1;
+                            $notification_model_detail->firebase_id = isset($response_result->results[0]->message_id) ? $response_result->results[0]->message_id : '';
+                        } else {
+                            $notification->status = 0;
+                            $notification_model_detail->firebase_message = isset($response_result->results[0]->error) ? $response_result->results[0]->error : '';
+                        }
+                    }
+
+                    if ($notification->update()) {
+                        
+                    } else {
+                        print_r($notification->getErrors());
+                    }
+
+                    if ($notification_model_detail->save()) {
+                        
+                    } else {
+                        print_r($notification_model_detail->getErrors());
+                    }
+
+                    //return TRUE;
+                } catch (\Exception $e) {
+                    \app\components\Techteammail::send($e->getMessage(), ' Send Notification To Member');
+                }
+            }
+        }
+        return $this->response;
+    }
+
+    public function actionLogin() {
+        $this->processLogin();
+        return $this->response;
+    }
+
+    public function actionUpdategoogletoken() {
+        //$this->processLogin();
+        $user = \Yii::$app->user->identity;
+        $active_app = AppDetail::findOne($this->current_module->model_apilog->app_id);
+        $active_app->firebase_token = $this->data_json['firebase_token'];
+        $active_app->app_version = $this->current_module->model_apilog->version_no;
+        $active_app->save();
+        return $this->response;
+    }
+
+    public function actionUpdatepassword() {
+        //$this->processLogin();
+        $user = \Yii::$app->user->identity;
+        $user->resetPassword($this->data_json['password']);
+        return $this->response;
+    }
+
+    public function actionList() {
+
+        $this->response['last_user_sync_time'] = $this->getLastUserUpdateTime();
+        $this->response['user_list'] = $this->getUserlist();
+
+        Yii::$app->db->createCommand()
+                ->update('notification', ['acknowledge_status' => 1, 'acknowledge_date' => date('Y-m-d H:i:s ')], 'notification_type = 1 and acknowledge_status = 0 and user_id = ' . \Yii::$app->user->identity->id)
+                ->execute();
+
+        return $this->response;
+    }
+
+    public function actionWbslist() {
+	     $wbs=array();
+        $wbs['status'] = "1";
+        $wbs['message'] = "Success";
+		 
+         $wbs_list= \app\models\Wbs::find()->select(['id', 'owner_id', 'wbs_title', 'start_date', 'end_date','wbs_group_id','wbs_user_id', 'status'])
+                ->where("status=1 and wbs_user_id!=0 and wbs_group_id!=0")
+                ->all();
+       $resultSets = [];
+        foreach($wbs_list as $key => $data):
+                $wbs_user = \app\models\WbsUser::findAll(["wbs_id" => $data->id]);
+                $resultSets[$key]['id'] = $data->id;
+                $resultSets[$key]['owner_id'] = $data->owner_id;
+                $resultSets[$key]['wbs_title'] = $data->wbs_title;
+                $resultSets[$key]['start_date'] = $data->start_date;
+                $resultSets[$key]['end_date'] = $data->end_date;
+                $resultSets[$key]['wbs_group_id'] = $data->wbs_group_id;
+                $resultSets[$key]['wbs_user_id'] = $data->wbs_user_id;
+                $resultSets[$key]['status'] = $data->status;
+                $resultSets[$key]['users'] = array_values($wbs_user);
+       endforeach;
+               $wbs['wbs_list'] = $resultSets;
+               return $wbs;     
+    }
+    
+    public function actionListall(){
+        $group = UserGroup::find()->all();
+        
+    }
+    public function actionSavewbs() {
+
+        if (isset($this->data_json['wbs_id']) && $this->data_json['wbs_id'] != '') {
+            $wbs_model = \app\models\Wbs::getModel($this->data_json['wbs_id'], \Yii::$app->user->identity->id);
+            if ($wbs_model == null) {
+                throw new \yii\web\ForbiddenHttpException("Forbidden");
+            } else {
+               
+                $form_model = new \app\models\form\WbsForm($this->data_json['wbs_id']);
+                // print_r($form_model->attributes);die;
+            }
+        } else {
+            $wbs_model = Yii::createObject([
+                        'class' => \app\models\Wbs::className(),
+            ]);
+            $form_model = new \app\models\form\WbsForm();
+          }
+  
+        
+        if ($form_model->load(['WbsForm' => $this->data_json])) {
+       
+            if ($form_model->validate()) {
+                    $selected_groups_ids = explode(",", $this->data_json['wbsgroups']);
+                     if(!empty($selected_groups_ids)) {
+                        $wbsuser[0]['group_id'] = $selected_groups_ids;
+                        $groups_member_id = array();
+                        $array1 = array();
+                            foreach($selected_groups_ids as $row => $grp_id): 
+                            $selected_member_group = '';
+                            $group_member = \app\models\Group::findOne($grp_id);
+                            $selected_member_group = $group_member->users;
+                            $groups_member_id = explode(",", $group_member->users);
+                            $array1 = array_merge($array1,$groups_member_id);
+                            endforeach;
+                            $array1 = array_unique($array1);
+                            $strUserId = implode(",",$array1);
+                     }
+                      if(!empty($array1)){    
+                          $wbsusers = explode(",", \Yii::$app->user->identity->id.",". $this->data_json['wbsusers']);
+                          $array1 = array_merge($wbsusers,$array1);
+                          $array1 = array_unique($array1);
+                          $form_model->wbsuser=$array1;
+                         // print_r(\Yii::$app->user->identity->id);die;
+                          }
+                         // $form_model->wbsuser = explode(",", \Yii::$app->user->identity->id.",".$strUserId);
+                            $form_model->wbs_group_id=$this->data_json['wbsgroups'];
+                            $form_model->wbs_user_id=$this->data_json['wbsusers'];
+                            
+                            $wbsentity = new \app\entites\WbsEntity($form_model, $wbs_model);  
+                           
+                            $wbsentity->save();
+                            $this->response['wbs_list'] = \app\models\Wbs::find()->where('status = "1"  and wbs_user_id != "null" and wbs_user_id != "null" and wbs_group_id != "null" and owner_id='.\Yii::$app->user->identity->id.' ')->orderBy('id desc')->all();
+                          //$this->response['wbs_users'] = $this->getWbsuserlist();
+            } else {
+                $this->response['status'] = "0";
+                $this->response['message'] = "Error(s): {" . \app\helpers\Utility::convertModelErrorToString($form_model) . "}";
+            }
+        } else {
+            throw new \yii\web\BadRequestHttpException("Bad Request, WBS form model not loaded or didn't validate"); // HTTP Code 400
+        }
+        return $this->response;
+    }
+
+    private function processLogin() {
+        if (isset($this->data_json['username']) and isset($this->data_json['password'])) {
+            
+            $model = \Yii::createObject(LoginForm::className());
+           echo $model->login = $this->data_json['username'];
+          echo  $model->password = $this->data_json['password'];
+          die;
+            if ($model->login()) {
+                $member_app = AppDetail::find()->where(['user_id' => \Yii::$app->user->identity->id, 'status' => 1])->all();
+                if (!empty($member_app)) {
+                    if (isset($this->data_json['confirm_overwrite']) && $this->data_json['confirm_overwrite'] == "1") {
+                        if (AppDetail::updateAll(['date_of_uninstall' => new Expression('NOW()'), 'status' => 0], 'user_id ="' . \Yii::$app->user->identity->id . '" and status=' . '1')) {
+                            $this->processLoginIntoDb(TRUE);
+                        } else {
+                            throw new \yii\web\ServerErrorHttpException('App registartion error : unable to diable old apps');
+                        }
+                    } else {
+                        $this->response['status'] = "0";
+                        $this->response['message'] = "you are already registered with some other device. Do you want to disable the previous device";
+                    }
+                } else {
+                    $this->processLoginIntoDb();
+                }
+            } else {
+                throw new \yii\web\UnauthorizedHttpException("Invalid username or password"); // HTTP code 401
+            }
+        } else {
+            throw new \yii\web\BadRequestHttpException("Bad Request, username or password missing"); // HTTP COde 400
+        }
+    }
+
+    private function processLoginIntoDb($confirm_overwrite = FALSE) {
+        $this->response['status'] = "1";
+        $member_app_model = new AppDetail();
+        $member_app_model->user_id = \Yii::$app->user->identity->id;
+        $member_app_model->org_id = \Yii::$app->user->identity->org_id;
+        $member_app_model->imei_no = $this->data_json['imei_no'];
+        $member_app_model->os_type = $this->data_json['os_type'];
+        $member_app_model->manufacturer_name = $this->data_json['manufacturer_name'];
+        $member_app_model->os_version = $this->data_json['os_version'];
+        $member_app_model->app_version = $this->data_json['app_version'];
+        $member_app_model->firebase_token = $this->data_json['firebase_token'];
+        $member_app_model->date_of_install = new Expression('NOW()');
+        if ($member_app_model->save()) {
+            $this->response['message'] = "success, request processed successfully";
+            $this->response['app_id'] = $member_app_model->id;
+            $this->response['user_id'] = $member_app_model->user_id;
+            $this->response['name'] = \Yii::$app->user->identity->name;
+            $this->response['org_name'] = \Yii::$app->user->identity->organization->name;
+            $this->response['sendbird_app_id'] = \Yii::$app->user->identity->organization->sendbird_app_id;
+
+            $this->response['last_user_sync_time'] = $this->getLastUserUpdateTime();
+            $this->response['user_list'] = $this->getUserlist();
+
+            $this->response['last_wbs_sync_time'] = $this->getLastWbsUpdateTime();
+            $this->response['wbs_list'] = $this->getWbslist();
+
+            $this->response['last_meeting_sync_time'] = $this->getLastWbsUpdateTime();
+            $this->response['meeting_detail_all'] = array(); // = $this->getMeetinglist();
+
+            foreach ($this->getMeetinglist() as $m) {
+                $meetingentity = new \app\entites\MeetingEntity(null, $m);
+                array_push($this->response['meeting_detail_all'], $meetingentity->getDetail());
+            }
+
+            $this->response['last_action_sync_time'] = $this->getLastWbsUpdateTime();
+            $this->response['action_detail_all'] = array(); // = $this->getMeetinglist();
+
+            foreach ($this->getActionlist() as $ac) {
+                    $actionentity = new \app\entites\ActionPointEntity(null, $ac);
+                    array_push($this->response['action_detail_all'], $actionentity->getDetail());
+                }
+
+            \app\models\Notification::updateAll(['acknowledge_status' => 1, 'acknowledge_date' => new Expression('NOW()'), 'app_id' => $member_app_model->id], 'user_id ="' . \Yii::$app->user->identity->id . '" and acknowledge_status=' . '0');
+        } else {
+            throw new \yii\web\ServerErrorHttpException("App registartion error : " . json_encode($member_app_model->getErrors()));
+        }
+    }
+
+    private function getUserlist($last_update_time = 000000) {
+        return \app\models\UserModel::find()->select(['id', 'name', 'email', 'status', 'profile_image'])->where(['=', 'org_id', \Yii::$app->user->identity->org_id])->andWhere(['>', 'updated_at', $last_update_time])->orderBy('updated_at asc')->all();
+    }
+
+    private function getLastUserUpdateTime($last_update_time = 000000) {
+        return \app\models\UserModel::find()->where(['=', 'org_id', \Yii::$app->user->identity->org_id])->andWhere(['=', 'role', '13'])->max('updated_at');
+    }
+
+    private function getWbslist() {
+
+        return \app\models\Wbs::find()->select(['id', 'owner_id', 'wbs_title', 'start_date', 'end_date', 'status'])->where(['=', 'org_id', \Yii::$app->user->identity->org_id])->orderBy('id DESC')->all();
+    }
+
+    private function getLastWbsUpdateTime($last_update_time = 000000) {
+        return \app\models\Wbs::find()->where(['=', 'owner_id', \Yii::$app->user->identity->id])->max('updated_at');
+    }
+
+    private function getMeetinglist($last_update_time = 000000) {
+        return \app\models\Meeting::find()->joinWith(['meetingusers'])->where(['=', 'meeting_user.user_id', \Yii::$app->user->identity->id])->all();
+//return \app\models\Wbs::find()->select(['id', 'owner_id', 'wbs_title', 'start_date', 'end_date', 'status'])->where(['=', 'owner_id', \Yii::$app->user->identity->id])->andWhere(['>', 'updated_at', $last_update_time])->orderBy('updated_at asc')->all();    
+    }
+
+    private function getLastMeetingUpdateTime($last_update_time = 000000) {
+        return \app\models\MeetingUser::find()->where(['=', 'user_id', \Yii::$app->user->identity->id])->max('updated_at');
+    }
+
+    private function getActionlist($last_update_time = 000000) {
+        //return \app\models\ActionPoint::find()->where(['=', 'action_assigned_to', \Yii::$app->user->identity->id])->orWhere(['=', 'action_assigned_by', \Yii::$app->user->identity->id])->all();
+        return \app\models\ActionPoint::find()->where(['or', 'action_assigned_to=' . \Yii::$app->user->identity->id, 'action_assigned_by=' . \Yii::$app->user->identity->id])->andWhere(['=', 'meeting_id', '0'])->all();
+//return \app\models\Wbs::find()->select(['id', 'owner_id', 'wbs_title', 'start_date', 'end_date', 'status'])->where(['=', 'owner_id', \Yii::$app->user->identity->id])->andWhere(['>', 'updated_at', $last_update_time])->orderBy('updated_at asc')->all();    
+    }
+
+}
+
